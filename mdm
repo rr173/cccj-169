@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Thin launcher so the CLI works under `python -I` without installation.
+
+Kept outside the package directory: data/package directories can never
+shadow stdlib modules via the script directory on sys.path.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from mdm_merge.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

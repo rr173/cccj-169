@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdm-merge"
+version = "1.0.0"
+description = "Offline multi-replica causal merge library for device master data (Python + SQLite)"
+readme = "PROTOCOL.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "mdm_merge authors" }]
+dependencies = []
+
+[project.scripts]
+mdm = "mdm_merge.cli:main"
+
+[tool.setuptools]
+packages = ["mdm_merge"]

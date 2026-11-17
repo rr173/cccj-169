@@ -1,0 +1,29 @@
+{
+  "format": "mdm-batch/v1",
+  "protocol_version": 1,
+  "ops": [
+    {
+      "op": "put",
+      "supplier": "Acme",
+      "asset_id": "pump-001",
+      "fields": {
+        "location": "warehouse-A",
+        "model": "PX-200",
+        "category": null
+      }
+    },
+    {
+      "op": "put",
+      "supplier": "Acme",
+      "asset_id": "pump-002",
+      "fields": {
+        "location": "site-7"
+      }
+    },
+    {
+      "op": "erase",
+      "supplier": "Acme",
+      "asset_id": "pump-legacy"
+    }
+  ]
+}
