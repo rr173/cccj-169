@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime-generated test databases and exported packages (never commit them)
+*.db
+*.db-wal
+*.db-shm
+*.json.tmp
+.tmp-*

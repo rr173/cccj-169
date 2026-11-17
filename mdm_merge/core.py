@@ -31,6 +31,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import protocol
+from . import subscriptions as _sub
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -97,6 +98,54 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     checkpoint_id TEXT PRIMARY KEY,
     supplier      TEXT NOT NULL,
     snapshot      TEXT NOT NULL
+);
+-- Downstream subscription outlet (see subscriptions.py / SUBSCRIPTIONS.md).
+-- All of these tables are created on open, so an existing replica database
+-- is upgraded in place; no historical change events are fabricated for
+-- pre-upgrade commits -- existing rows are delivered through first loads.
+CREATE TABLE IF NOT EXISTS sub_subscriptions (
+    sub_id        TEXT PRIMARY KEY,
+    supplier      TEXT NOT NULL,
+    cut_seq       INTEGER NOT NULL,          -- events with seq <= cut_seq
+                                             -- are inside the initial load
+    state         TEXT NOT NULL,             -- loading | live | released
+    page_size     INTEGER NOT NULL,
+    load_total    INTEGER NOT NULL,          -- rows materialized at the cut
+    created_at    TEXT NOT NULL,
+    released_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS sub_load_rows (
+    sub_id     TEXT NOT NULL,
+    supplier   TEXT NOT NULL,
+    asset_id   TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    creator    TEXT NOT NULL,
+    counter    INTEGER NOT NULL,
+    value      TEXT,
+    PRIMARY KEY (sub_id, asset_id, field, creator, counter)
+);
+CREATE TABLE IF NOT EXISTS sub_load_acks (
+    sub_id     TEXT NOT NULL,
+    page_index INTEGER NOT NULL,
+    PRIMARY KEY (sub_id, page_index)
+);
+CREATE TABLE IF NOT EXISTS sub_partition (
+    supplier      TEXT PRIMARY KEY,
+    earliest_seq  INTEGER NOT NULL,
+    latest_seq    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sub_events (
+    supplier  TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    txn_kind  TEXT NOT NULL,                 -- local_batch | merge
+    payload   TEXT NOT NULL,                 -- canonical change document
+    PRIMARY KEY (supplier, seq)
+);
+CREATE TABLE IF NOT EXISTS sub_progress (
+    sub_id          TEXT NOT NULL,
+    delivered_seq   INTEGER NOT NULL,        -- ever handed out (not confirmed)
+    confirmed_seq   INTEGER NOT NULL,        -- consumer-durable watermark
+    PRIMARY KEY (sub_id)
 );
 """
 
@@ -281,8 +330,14 @@ class Replica:
             {"format": protocol.BATCH_FORMAT,
              "protocol_version": protocol.PROTOCOL_VERSION, "ops": ops})
         counters: List[int] = []
+        # Capture the complete pre-txn live version sets of every row the
+        # batch may touch, one snapshot per partition. This happens *inside*
+        # the transaction about to be opened, so the subscription outlet
+        # publishes the exact before/after boundary of this commit.
+        touched_keys = _sub.touched_assets(norm["ops"])
         try:
             self.conn.execute("BEGIN")
+            before = _sub.snapshot_live(self.conn, touched_keys)
             for op in norm["ops"]:
                 counter = self._next_counter()
                 counters.append(counter)
@@ -326,6 +381,12 @@ class Replica:
             touched = {op["supplier"] for op in norm["ops"]}
             for s in touched:
                 self._recompute_liveness(s)
+            # Publish per-partition change events inside the SAME transaction:
+            # business writes, change rows and the monotonic event positions
+            # commit together or roll back together. Only partitions whose
+            # committed live sets actually changed consume an event position.
+            _sub.publish_changes(self.conn, touched_keys, before,
+                                 kind="local_batch", crash_tag="event")
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
@@ -421,10 +482,20 @@ class Replica:
         pkg = protocol.validate_handoff(pkg)
         supplier = pkg["supplier"]
         adds, kills = pkg["adds"], pkg["kills"]
+        # Preserve the historical MergeError contract for scope escapes;
+        # the outlet's touched-key capture below then never has to raise.
+        for rec in (*adds, *kills):
+            if rec["supplier"] != supplier:
+                raise MergeError("package record escapes its supplier scope")
+        touched_keys = _sub.touched_assets_records(supplier, adds, kills)
         crash_at = os.environ.get("MDM_CRASH_AT")
         steps = 0
         try:
             self.conn.execute("BEGIN")
+            # Pre-commit boundary for the subscription outlet; taken inside
+            # the merge transaction so event content matches exactly what
+            # this commit changed.
+            before = _sub.snapshot_live(self.conn, touched_keys)
             # Integrate the causal frontier first: it is an independent union
             # summary and decides which buffered tombstones are reachable.
             if pkg["kind"] == protocol.KIND_CHECKPOINT:
@@ -463,6 +534,11 @@ class Replica:
             # Re-derive every live flag from the settled watermarks so add
             # and kill application order within the package cannot matter.
             self._recompute_liveness(supplier)
+            # A duplicate package or one that only advances causal knowledge
+            # yields identical live sets: publish_changes emits nothing and
+            # consumes no event position for it.
+            _sub.publish_changes(self.conn, touched_keys, before,
+                                 kind="merge", crash_tag="event")
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
